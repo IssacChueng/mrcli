@@ -13,6 +13,13 @@ pub enum AppState {
     ResultView,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorMode {
+    Normal,
+    Insert,
+    Command,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub default_connection: Option<String>,

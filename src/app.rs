@@ -2,13 +2,15 @@ use std::time::Instant;
 use std::{sync::mpsc, thread};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tui_textarea::{Input, TextArea};
+use tui_textarea::{CursorMove, Input, TextArea};
 
+use crate::completion::{self, CompletionItem};
 use crate::config;
 use crate::db;
 use crate::drafts;
 use crate::model::{
-    AppConfig, AppState, DraftEntry, ExecutionHandle, ExecutionResult, PendingExecution, ResultKind,
+    AppConfig, AppState, DraftEntry, EditorMode, ExecutionHandle, ExecutionResult,
+    PendingExecution, ResultKind,
 };
 
 pub struct App {
@@ -18,6 +20,12 @@ pub struct App {
     pub drafts: Vec<DraftEntry>,
     pub selected_draft_index: Option<usize>,
     pub editor: TextArea<'static>,
+    pub editor_mode: EditorMode,
+    pub command_buffer: String,
+    pub completion_open: bool,
+    pub completion_items: Vec<CompletionItem>,
+    pub completion_selected_index: usize,
+    pub completion_prefix: String,
     pub current_result: Option<ExecutionResult>,
     pub status_message: Option<String>,
     pub last_error: Option<String>,
@@ -42,6 +50,12 @@ impl App {
             drafts: Vec::new(),
             selected_draft_index: None,
             editor: Self::new_editor(String::new()),
+            editor_mode: EditorMode::Normal,
+            command_buffer: String::new(),
+            completion_open: false,
+            completion_items: Vec::new(),
+            completion_selected_index: 0,
+            completion_prefix: String::new(),
             current_result: None,
             status_message: None,
             last_error: None,
@@ -162,9 +176,97 @@ impl App {
     }
 
     fn handle_query_edit_key(&mut self, key: KeyEvent) {
+        match self.editor_mode {
+            EditorMode::Normal => self.handle_query_edit_normal_key(key),
+            EditorMode::Insert => self.handle_query_edit_insert_key(key),
+            EditorMode::Command => self.handle_query_edit_command_key(key),
+        }
+    }
+
+    fn handle_query_edit_normal_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.state = AppState::QueryList;
+                self.status_message = Some("returned to draft list".to_string());
+            }
+            KeyCode::Char('i') => {
+                self.editor_mode = EditorMode::Insert;
+                self.close_completion();
+                self.status_message = Some("insert mode".to_string());
+            }
+            KeyCode::Char('a') => {
+                self.editor.move_cursor(CursorMove::Forward);
+                self.editor_mode = EditorMode::Insert;
+                self.close_completion();
+                self.status_message = Some("append mode".to_string());
+            }
+            KeyCode::Char('o') => {
+                self.editor.move_cursor(CursorMove::End);
+                self.editor.insert_newline();
+                self.editor_mode = EditorMode::Insert;
+                self.close_completion();
+                self.status_message = Some("opened new line".to_string());
+            }
+            KeyCode::Char(':') => {
+                self.command_buffer.clear();
+                self.close_completion();
+                self.editor_mode = EditorMode::Command;
+                self.status_message = Some("command mode".to_string());
+            }
+            KeyCode::Char('h') | KeyCode::Left => self.editor.move_cursor(CursorMove::Back),
+            KeyCode::Char('j') | KeyCode::Down => self.editor.move_cursor(CursorMove::Down),
+            KeyCode::Char('k') | KeyCode::Up => self.editor.move_cursor(CursorMove::Up),
+            KeyCode::Char('l') | KeyCode::Right => self.editor.move_cursor(CursorMove::Forward),
+            KeyCode::Char('0') | KeyCode::Home => self.editor.move_cursor(CursorMove::Head),
+            KeyCode::Char('$') | KeyCode::End => self.editor.move_cursor(CursorMove::End),
+            KeyCode::Char('G') => self.editor.move_cursor(CursorMove::Bottom),
+            KeyCode::Char('x') => {
+                self.editor.delete_next_char();
+            }
+            KeyCode::F(5) => {
+                if self.save_current_editor() {
+                    self.start_execution_from_editor();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_query_edit_insert_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc {
-            self.state = AppState::QueryList;
-            self.status_message = Some("returned to draft list".to_string());
+            if self.completion_open {
+                self.close_completion();
+            } else {
+                self.editor_mode = EditorMode::Normal;
+                self.status_message = Some("normal mode".to_string());
+            }
+            return;
+        }
+
+        if self.completion_open {
+            match key.code {
+                KeyCode::Up => {
+                    self.completion_selected_index =
+                        self.completion_selected_index.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.completion_selected_index = self
+                        .completion_selected_index
+                        .saturating_add(1)
+                        .min(self.completion_items.len().saturating_sub(1));
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    self.apply_selected_completion();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        if key.code == KeyCode::Char(' ') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.refresh_completion(true);
             return;
         }
 
@@ -181,6 +283,28 @@ impl App {
         }
 
         self.editor.input(Input::from(key));
+        self.refresh_completion(false);
+    }
+
+    fn handle_query_edit_command_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.command_buffer.clear();
+                self.close_completion();
+                self.editor_mode = EditorMode::Normal;
+                self.status_message = Some("normal mode".to_string());
+            }
+            KeyCode::Enter => self.execute_editor_command(),
+            KeyCode::Backspace => {
+                self.command_buffer.pop();
+            }
+            KeyCode::Char(value) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.command_buffer.push(value);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn handle_query_running_key(&mut self, key: KeyEvent) {
@@ -210,6 +334,8 @@ impl App {
             }
             KeyCode::Char('e') => {
                 if self.selected_draft_index.is_some() {
+                    self.editor_mode = EditorMode::Normal;
+                    self.command_buffer.clear();
                     self.state = AppState::QueryEdit;
                 }
             }
@@ -340,6 +466,9 @@ impl App {
         };
 
         self.editor = Self::new_editor(content);
+        self.editor_mode = EditorMode::Normal;
+        self.command_buffer.clear();
+        self.close_completion();
         self.state = AppState::QueryEdit;
         self.status_message = Some(format!("editing {}", file_name));
     }
@@ -355,6 +484,9 @@ impl App {
                     .position(|draft| draft.file_name == file_name)
                     .or(Some(0));
                 self.editor = Self::new_editor(String::new());
+                self.editor_mode = EditorMode::Normal;
+                self.command_buffer.clear();
+                self.close_completion();
                 self.state = AppState::QueryEdit;
                 self.last_error = None;
                 self.status_message = Some(format!("created {}", file_name));
@@ -474,6 +606,46 @@ impl App {
         editor.set_style(ratatui::style::Style::default());
         editor.set_cursor_line_style(Default::default());
         editor
+    }
+
+    fn execute_editor_command(&mut self) {
+        let command = self.command_buffer.trim().to_ascii_lowercase();
+        self.command_buffer.clear();
+
+        match command.as_str() {
+            "w" => {
+                self.save_current_editor();
+                self.editor_mode = EditorMode::Normal;
+            }
+            "q" | "q!" => {
+                self.editor_mode = EditorMode::Normal;
+                self.state = AppState::QueryList;
+                self.status_message = Some("returned to draft list".to_string());
+            }
+            "wq" | "x" => {
+                if self.save_current_editor() {
+                    self.editor_mode = EditorMode::Normal;
+                    self.state = AppState::QueryList;
+                    self.status_message = Some("saved and returned to draft list".to_string());
+                } else {
+                    self.editor_mode = EditorMode::Normal;
+                }
+            }
+            "run" => {
+                self.editor_mode = EditorMode::Normal;
+                if self.save_current_editor() {
+                    self.start_execution_from_editor();
+                }
+            }
+            "" => {
+                self.editor_mode = EditorMode::Normal;
+                self.status_message = Some("normal mode".to_string());
+            }
+            _ => {
+                self.editor_mode = EditorMode::Normal;
+                self.status_message = Some(format!("unknown command: {command}"));
+            }
+        }
     }
 
     fn max_row_offset(&self) -> usize {
@@ -623,6 +795,69 @@ impl App {
         let column_name = result.columns.get(self.result_selected_col)?;
         let value = row.get(self.result_selected_col)?;
         Some((column_name.as_str(), value.as_str()))
+    }
+
+    fn refresh_completion(&mut self, force_open: bool) {
+        let prefix = self.current_editor_prefix();
+        let items = completion::sql_completions(&prefix);
+
+        if items.is_empty() || (!force_open && prefix.is_empty()) {
+            self.close_completion();
+            return;
+        }
+
+        self.completion_prefix = prefix;
+        self.completion_items = items;
+        self.completion_selected_index = self
+            .completion_selected_index
+            .min(self.completion_items.len().saturating_sub(1));
+        self.completion_open = true;
+    }
+
+    fn close_completion(&mut self) {
+        self.completion_open = false;
+        self.completion_items.clear();
+        self.completion_selected_index = 0;
+        self.completion_prefix.clear();
+    }
+
+    fn apply_selected_completion(&mut self) {
+        let Some(item) = self
+            .completion_items
+            .get(self.completion_selected_index)
+            .cloned()
+        else {
+            self.close_completion();
+            return;
+        };
+
+        let prefix_len = self.completion_prefix.chars().count();
+        for _ in 0..prefix_len {
+            self.editor.move_cursor(CursorMove::Back);
+            self.editor.delete_next_char();
+        }
+        self.editor.insert_str(item.insert_text);
+        self.close_completion();
+    }
+
+    fn current_editor_prefix(&self) -> String {
+        let (row, col) = self.editor.cursor();
+        let Some(line) = self.editor.lines().get(row) else {
+            return String::new();
+        };
+        let before_cursor = line.chars().take(col).collect::<String>();
+        before_cursor
+            .chars()
+            .rev()
+            .take_while(|value| value.is_ascii_alphanumeric() || *value == '_')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect()
+    }
+
+    pub fn command_hints(&self) -> Vec<&'static str> {
+        completion::command_hints(&self.command_buffer)
     }
 }
 

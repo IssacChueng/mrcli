@@ -5,7 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, Wrap};
 
 use crate::app::App;
-use crate::model::{AppState, ResultKind};
+use crate::completion::CompletionKind;
+use crate::model::{AppState, EditorMode, ResultKind};
 
 const BG: Color = Color::Rgb(10, 20, 10);
 const FG: Color = Color::Rgb(120, 255, 120);
@@ -61,6 +62,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     if app.state == AppState::ResultView && app.result_cell_detail_open {
         render_result_cell_detail(frame, area, app);
+    }
+    if app.state == AppState::QueryEdit {
+        if app.editor_mode == EditorMode::Command {
+            render_command_hints(frame, area, app);
+        } else if app.completion_open {
+            render_completion(frame, area, app);
+        }
     }
 }
 
@@ -225,6 +233,12 @@ fn render_query_edit(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
+            Span::styled("MODE ", Style::default().fg(DIM)),
+            Span::styled(
+                editor_mode_name(app.editor_mode),
+                editor_mode_style(app.editor_mode),
+            ),
+            Span::styled("  |  ", Style::default().fg(DIM)),
             Span::styled("LINK ", Style::default().fg(DIM)),
             Span::styled(
                 connection,
@@ -242,6 +256,16 @@ fn render_query_edit(frame: &mut Frame, area: Rect, app: &App) {
                 format!("{line_count} lines / {char_count} chars"),
                 Style::default().fg(FG),
             ),
+            if app.editor_mode == EditorMode::Command {
+                Span::styled("  |  :", Style::default().fg(DIM))
+            } else {
+                Span::raw("")
+            },
+            if app.editor_mode == EditorMode::Command {
+                Span::styled(app.command_buffer.as_str(), Style::default().fg(FG))
+            } else {
+                Span::raw("")
+            },
         ]))
         .style(Style::default().fg(FG).bg(PANEL_BG))
         .block(block("EDITOR STATUS")),
@@ -420,7 +444,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let help = match app.state {
         AppState::Init => "Up/Down Move  Enter Open  r Reload Config  q Quit",
         AppState::QueryList => "Up/Down Move  Enter Edit  n New  d Delete  F5 Run  Esc Back",
-        AppState::QueryEdit => "Ctrl+S Save  F5 Save+Run  Esc Back",
+        AppState::QueryEdit => match app.editor_mode {
+            EditorMode::Normal => "i Insert  : Command  h/j/k/l Move  x Delete  F5 Run  Esc Back",
+            EditorMode::Insert => {
+                "Ctrl+Space Complete  Tab/Enter Accept  Esc Normal  Ctrl+S Save  F5 Run"
+            }
+            EditorMode::Command => ":w Save  :q Back  :wq Save+Back  :run Execute  Esc Normal",
+        },
         AppState::QueryRunning => "q Quit",
         AppState::ResultView => {
             if app.result_cell_detail_open {
@@ -666,6 +696,75 @@ fn render_result_cell_detail(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn render_command_hints(frame: &mut Frame, area: Rect, app: &App) {
+    let hints = app.command_hints();
+    if hints.is_empty() {
+        return;
+    }
+
+    let popup = bottom_right_rect(34, hints.len() as u16 + 2, area);
+    frame.render_widget(Clear, popup);
+    let lines = hints
+        .iter()
+        .map(|hint| {
+            Line::from(vec![
+                Span::styled(":", Style::default().fg(DIM)),
+                Span::styled(*hint, Style::default().fg(FG).add_modifier(Modifier::BOLD)),
+                Span::styled("  ", Style::default().fg(DIM)),
+                Span::styled(command_hint_description(hint), Style::default().fg(DIM)),
+            ])
+        })
+        .collect::<Vec<_>>();
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(FG).bg(PANEL_BG))
+            .block(block("COMMAND HINTS")),
+        popup,
+    );
+}
+
+fn render_completion(frame: &mut Frame, area: Rect, app: &App) {
+    if app.completion_items.is_empty() {
+        return;
+    }
+
+    let popup = bottom_right_rect(36, app.completion_items.len() as u16 + 2, area);
+    frame.render_widget(Clear, popup);
+    let lines = app
+        .completion_items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let selected = index == app.completion_selected_index;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(SELECT_BG)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(FG).bg(PANEL_BG)
+            };
+            Line::from(vec![
+                Span::styled(if selected { ">> " } else { "   " }, style),
+                Span::styled(item.label, style),
+                Span::styled("  ", style),
+                Span::styled(
+                    completion_kind_name(item.kind),
+                    Style::default().fg(DIM).bg(PANEL_BG),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(FG).bg(PANEL_BG))
+            .block(block("SQL COMPLETION")),
+        popup,
+    );
+}
+
 fn state_name(state: &AppState) -> &'static str {
     match state {
         AppState::Init => "INIT",
@@ -683,6 +782,22 @@ fn state_phrase(state: &AppState) -> &'static str {
         AppState::QueryEdit => "COMMAND COMPOSER",
         AppState::QueryRunning => "EXECUTION CORE ACTIVE",
         AppState::ResultView => "DATA MATRIX",
+    }
+}
+
+fn editor_mode_name(mode: EditorMode) -> &'static str {
+    match mode {
+        EditorMode::Normal => "NORMAL",
+        EditorMode::Insert => "INSERT",
+        EditorMode::Command => "COMMAND",
+    }
+}
+
+fn editor_mode_style(mode: EditorMode) -> Style {
+    match mode {
+        EditorMode::Normal => Style::default().fg(FG).add_modifier(Modifier::BOLD),
+        EditorMode::Insert => Style::default().fg(CELL_BG).add_modifier(Modifier::BOLD),
+        EditorMode::Command => Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
     }
 }
 
@@ -722,6 +837,36 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+fn bottom_right_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width.saturating_sub(2)).max(1);
+    let height = height.min(area.height.saturating_sub(2)).max(1);
+    Rect {
+        x: area.x + area.width.saturating_sub(width + 1),
+        y: area.y + area.height.saturating_sub(height + 4),
+        width,
+        height,
+    }
+}
+
+fn command_hint_description(command: &str) -> &'static str {
+    match command {
+        "w" => "save buffer",
+        "q" => "back to list",
+        "wq" => "save and back",
+        "x" => "save and back",
+        "run" => "save and execute",
+        "q!" => "back without save",
+        _ => "command",
+    }
+}
+
+fn completion_kind_name(kind: CompletionKind) -> &'static str {
+    match kind {
+        CompletionKind::Keyword => "keyword",
+        CompletionKind::Function => "function",
+    }
 }
 
 fn truncate_cell(value: &str, max_len: usize) -> String {
