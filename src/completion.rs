@@ -129,6 +129,38 @@ pub fn sql_completions(prefix: &str) -> Vec<CompletionItem> {
         .collect()
 }
 
+pub fn normalize_sql_keyword(token: &str) -> Option<&'static str> {
+    let token = token.to_ascii_uppercase();
+    let keyword = match token.as_str() {
+        "SELECT" => "SELECT",
+        "FROM" => "FROM",
+        "WHERE" => "WHERE",
+        "JOIN" => "JOIN",
+        "LEFT" => "LEFT",
+        "INNER" => "INNER",
+        "GROUP" => "GROUP",
+        "BY" => "BY",
+        "ORDER" => "ORDER",
+        "LIMIT" => "LIMIT",
+        "INSERT" => "INSERT",
+        "INTO" => "INTO",
+        "UPDATE" => "UPDATE",
+        "DELETE" => "DELETE",
+        "CREATE" => "CREATE",
+        "ALTER" => "ALTER",
+        "DROP" => "DROP",
+        "TABLE" => "TABLE",
+        "COUNT" => "COUNT",
+        "SUM" => "SUM",
+        "AVG" => "AVG",
+        "MIN" => "MIN",
+        "MAX" => "MAX",
+        "NOW" => "NOW",
+        _ => return None,
+    };
+    Some(keyword)
+}
+
 pub fn command_hints(prefix: &str) -> Vec<&'static str> {
     const COMMANDS: &[&str] = &["w", "q", "wq", "x", "run", "q!"];
     let prefix = prefix.to_ascii_lowercase();

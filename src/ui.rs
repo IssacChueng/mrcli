@@ -256,6 +256,19 @@ fn render_query_edit(frame: &mut Frame, area: Rect, app: &App) {
                 format!("{line_count} lines / {char_count} chars"),
                 Style::default().fg(FG),
             ),
+            if app.editor_mode == EditorMode::Normal && !app.normal_count_buffer.is_empty() {
+                Span::styled("  |  COUNT ", Style::default().fg(DIM))
+            } else {
+                Span::raw("")
+            },
+            if app.editor_mode == EditorMode::Normal && !app.normal_count_buffer.is_empty() {
+                Span::styled(
+                    app.normal_count_buffer.as_str(),
+                    Style::default().fg(CELL_BG).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("")
+            },
             if app.editor_mode == EditorMode::Command {
                 Span::styled("  |  :", Style::default().fg(DIM))
             } else {
@@ -445,7 +458,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         AppState::Init => "Up/Down Move  Enter Open  r Reload Config  q Quit",
         AppState::QueryList => "Up/Down Move  Enter Edit  n New  d Delete  F5 Run  Esc Back",
         AppState::QueryEdit => match app.editor_mode {
-            EditorMode::Normal => "i Insert  : Command  h/j/k/l Move  x Delete  F5 Run  Esc Back",
+            EditorMode::Normal => {
+                "[count]h/j/k/l Move  [count]x Delete  [count]G Go  i Insert  : Command  Esc Back"
+            }
             EditorMode::Insert => {
                 "Ctrl+Space Complete  Tab/Enter Accept  Esc Normal  Ctrl+S Save  F5 Run"
             }

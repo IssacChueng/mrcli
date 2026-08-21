@@ -22,6 +22,7 @@ pub struct App {
     pub editor: TextArea<'static>,
     pub editor_mode: EditorMode,
     pub command_buffer: String,
+    pub normal_count_buffer: String,
     pub completion_open: bool,
     pub completion_items: Vec<CompletionItem>,
     pub completion_selected_index: usize,
@@ -52,6 +53,7 @@ impl App {
             editor: Self::new_editor(String::new()),
             editor_mode: EditorMode::Normal,
             command_buffer: String::new(),
+            normal_count_buffer: String::new(),
             completion_open: false,
             completion_items: Vec::new(),
             completion_selected_index: 0,
@@ -186,21 +188,32 @@ impl App {
     fn handle_query_edit_normal_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.state = AppState::QueryList;
-                self.status_message = Some("returned to draft list".to_string());
+                if self.normal_count_buffer.is_empty() {
+                    self.state = AppState::QueryList;
+                    self.status_message = Some("returned to draft list".to_string());
+                } else {
+                    self.normal_count_buffer.clear();
+                    self.status_message = Some("count cleared".to_string());
+                }
+            }
+            KeyCode::Char(value) if value.is_ascii_digit() => {
+                self.handle_normal_count_digit(value);
             }
             KeyCode::Char('i') => {
+                self.normal_count_buffer.clear();
                 self.editor_mode = EditorMode::Insert;
                 self.close_completion();
                 self.status_message = Some("insert mode".to_string());
             }
             KeyCode::Char('a') => {
+                self.normal_count_buffer.clear();
                 self.editor.move_cursor(CursorMove::Forward);
                 self.editor_mode = EditorMode::Insert;
                 self.close_completion();
                 self.status_message = Some("append mode".to_string());
             }
             KeyCode::Char('o') => {
+                self.normal_count_buffer.clear();
                 self.editor.move_cursor(CursorMove::End);
                 self.editor.insert_newline();
                 self.editor_mode = EditorMode::Insert;
@@ -208,22 +221,30 @@ impl App {
                 self.status_message = Some("opened new line".to_string());
             }
             KeyCode::Char(':') => {
+                self.normal_count_buffer.clear();
                 self.command_buffer.clear();
                 self.close_completion();
                 self.editor_mode = EditorMode::Command;
                 self.status_message = Some("command mode".to_string());
             }
-            KeyCode::Char('h') | KeyCode::Left => self.editor.move_cursor(CursorMove::Back),
-            KeyCode::Char('j') | KeyCode::Down => self.editor.move_cursor(CursorMove::Down),
-            KeyCode::Char('k') | KeyCode::Up => self.editor.move_cursor(CursorMove::Up),
-            KeyCode::Char('l') | KeyCode::Right => self.editor.move_cursor(CursorMove::Forward),
-            KeyCode::Char('0') | KeyCode::Home => self.editor.move_cursor(CursorMove::Head),
-            KeyCode::Char('$') | KeyCode::End => self.editor.move_cursor(CursorMove::End),
-            KeyCode::Char('G') => self.editor.move_cursor(CursorMove::Bottom),
+            KeyCode::Char('h') | KeyCode::Left => self.repeat_cursor_move(CursorMove::Back),
+            KeyCode::Char('j') | KeyCode::Down => self.repeat_cursor_move(CursorMove::Down),
+            KeyCode::Char('k') | KeyCode::Up => self.repeat_cursor_move(CursorMove::Up),
+            KeyCode::Char('l') | KeyCode::Right => self.repeat_cursor_move(CursorMove::Forward),
+            KeyCode::Home => self.editor.move_cursor(CursorMove::Head),
+            KeyCode::Char('$') | KeyCode::End => {
+                self.normal_count_buffer.clear();
+                self.editor.move_cursor(CursorMove::End);
+            }
+            KeyCode::Char('G') => self.handle_goto_line_or_bottom(),
             KeyCode::Char('x') => {
-                self.editor.delete_next_char();
+                let count = self.take_normal_count();
+                for _ in 0..count {
+                    self.editor.delete_next_char();
+                }
             }
             KeyCode::F(5) => {
+                self.normal_count_buffer.clear();
                 if self.save_current_editor() {
                     self.start_execution_from_editor();
                 }
@@ -282,7 +303,18 @@ impl App {
             return;
         }
 
+        if key.code == KeyCode::Enter {
+            self.normalize_previous_sql_keyword();
+            self.editor.input(Input::from(key));
+            self.refresh_completion(false);
+            return;
+        }
+
+        let should_normalize = should_normalize_previous_keyword(key);
         self.editor.input(Input::from(key));
+        if should_normalize {
+            self.normalize_previous_sql_keyword();
+        }
         self.refresh_completion(false);
     }
 
@@ -468,6 +500,7 @@ impl App {
         self.editor = Self::new_editor(content);
         self.editor_mode = EditorMode::Normal;
         self.command_buffer.clear();
+        self.normal_count_buffer.clear();
         self.close_completion();
         self.state = AppState::QueryEdit;
         self.status_message = Some(format!("editing {}", file_name));
@@ -486,6 +519,7 @@ impl App {
                 self.editor = Self::new_editor(String::new());
                 self.editor_mode = EditorMode::Normal;
                 self.command_buffer.clear();
+                self.normal_count_buffer.clear();
                 self.close_completion();
                 self.state = AppState::QueryEdit;
                 self.last_error = None;
@@ -645,6 +679,52 @@ impl App {
                 self.editor_mode = EditorMode::Normal;
                 self.status_message = Some(format!("unknown command: {command}"));
             }
+        }
+    }
+
+    fn handle_normal_count_digit(&mut self, value: char) {
+        if value == '0' && self.normal_count_buffer.is_empty() {
+            self.editor.move_cursor(CursorMove::Head);
+            return;
+        }
+
+        if self.normal_count_buffer.len() < 4 {
+            self.normal_count_buffer.push(value);
+        }
+    }
+
+    fn normal_count(&self) -> usize {
+        self.normal_count_buffer
+            .parse::<usize>()
+            .ok()
+            .filter(|count| *count > 0)
+            .unwrap_or(1)
+            .min(9999)
+    }
+
+    fn take_normal_count(&mut self) -> usize {
+        let count = self.normal_count();
+        self.normal_count_buffer.clear();
+        count
+    }
+
+    fn repeat_cursor_move(&mut self, movement: CursorMove) {
+        let count = self.take_normal_count();
+        for _ in 0..count {
+            self.editor.move_cursor(movement);
+        }
+    }
+
+    fn handle_goto_line_or_bottom(&mut self) {
+        if self.normal_count_buffer.is_empty() {
+            self.editor.move_cursor(CursorMove::Bottom);
+            return;
+        }
+
+        let target_line = self.take_normal_count().saturating_sub(1);
+        self.editor.move_cursor(CursorMove::Top);
+        for _ in 0..target_line {
+            self.editor.move_cursor(CursorMove::Down);
         }
     }
 
@@ -856,9 +936,97 @@ impl App {
             .collect()
     }
 
+    fn normalize_previous_sql_keyword(&mut self) {
+        let Some((token, delimiter_width)) = self.previous_editor_token() else {
+            return;
+        };
+        let Some(normalized) = completion::normalize_sql_keyword(&token) else {
+            return;
+        };
+        if token == normalized {
+            return;
+        }
+
+        for _ in 0..delimiter_width {
+            self.editor.move_cursor(CursorMove::Back);
+        }
+        for _ in 0..token.chars().count() {
+            self.editor.move_cursor(CursorMove::Back);
+            self.editor.delete_next_char();
+        }
+        self.editor.insert_str(normalized);
+        for _ in 0..delimiter_width {
+            self.editor.move_cursor(CursorMove::Forward);
+        }
+    }
+
+    fn previous_editor_token(&self) -> Option<(String, usize)> {
+        let (row, col) = self.editor.cursor();
+        let line = self.editor.lines().get(row)?;
+        let before_cursor = line.chars().take(col).collect::<String>();
+        if is_inside_single_quote(&before_cursor) {
+            return None;
+        }
+
+        let chars = before_cursor.chars().collect::<Vec<_>>();
+        let mut end = chars.len();
+        while end > 0 && is_sql_delimiter(chars[end - 1]) {
+            end -= 1;
+        }
+        let delimiter_width = chars.len().saturating_sub(end);
+        if end == 0 {
+            return None;
+        }
+
+        let mut start = end;
+        while start > 0 && is_sql_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+        if start == end {
+            return None;
+        }
+
+        Some((chars[start..end].iter().collect(), delimiter_width))
+    }
+
     pub fn command_hints(&self) -> Vec<&'static str> {
         completion::command_hints(&self.command_buffer)
     }
+}
+
+fn should_normalize_previous_keyword(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Enter | KeyCode::Tab => true,
+        KeyCode::Char(value) => is_sql_delimiter(value),
+        _ => false,
+    }
+}
+
+fn is_sql_word_char(value: char) -> bool {
+    value.is_ascii_alphanumeric() || value == '_'
+}
+
+fn is_sql_delimiter(value: char) -> bool {
+    matches!(
+        value,
+        ' ' | '\t' | '\n' | '(' | ')' | ',' | ';' | '=' | '<' | '>' | '+' | '-' | '*' | '/'
+    )
+}
+
+fn is_inside_single_quote(value: &str) -> bool {
+    let mut escaped = false;
+    let mut quote_count = 0usize;
+    for ch in value.chars() {
+        if ch == '\\' && !escaped {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !escaped {
+            quote_count += 1;
+        }
+        escaped = false;
+    }
+    quote_count % 2 == 1
 }
 
 fn move_index(current: usize, len: usize, delta: isize) -> usize {
