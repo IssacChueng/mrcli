@@ -9,8 +9,8 @@ use crate::config;
 use crate::db;
 use crate::drafts;
 use crate::model::{
-    AppConfig, AppState, DraftEntry, EditorMode, ExecutionHandle, ExecutionResult,
-    PendingExecution, ResultKind,
+    AppConfig, AppState, DatabaseMetadata, DraftEntry, EditorMode, ExecutionHandle,
+    ExecutionResult, MetadataHandle, PendingExecution, ResultKind,
 };
 
 pub struct App {
@@ -27,6 +27,10 @@ pub struct App {
     pub completion_items: Vec<CompletionItem>,
     pub completion_selected_index: usize,
     pub completion_prefix: String,
+    pub metadata: Option<DatabaseMetadata>,
+    pub metadata_loading: bool,
+    pub metadata_error: Option<String>,
+    pub metadata_handle: Option<MetadataHandle>,
     pub current_result: Option<ExecutionResult>,
     pub status_message: Option<String>,
     pub last_error: Option<String>,
@@ -58,6 +62,10 @@ impl App {
             completion_items: Vec::new(),
             completion_selected_index: 0,
             completion_prefix: String::new(),
+            metadata: None,
+            metadata_loading: false,
+            metadata_error: None,
+            metadata_handle: None,
             current_result: None,
             status_message: None,
             last_error: None,
@@ -88,6 +96,8 @@ impl App {
     }
 
     pub fn on_tick(&mut self) {
+        self.poll_metadata();
+
         if self.state != AppState::QueryRunning {
             return;
         }
@@ -156,6 +166,7 @@ impl App {
             KeyCode::Down => self.move_connection_selection(1),
             KeyCode::Enter => {
                 self.reload_drafts();
+                self.start_metadata_load();
                 self.state = AppState::QueryList;
                 self.status_message = Some("entered draft list".to_string());
             }
@@ -425,11 +436,19 @@ impl App {
             Ok(config) => {
                 self.selected_connection_index = config::default_connection_index(&config);
                 self.config = Some(config);
+                self.metadata = None;
+                self.metadata_error = None;
+                self.metadata_handle = None;
+                self.metadata_loading = false;
                 self.last_error = None;
                 self.status_message = Some("config loaded".to_string());
             }
             Err(error) => {
                 self.config = None;
+                self.metadata = None;
+                self.metadata_error = None;
+                self.metadata_handle = None;
+                self.metadata_loading = false;
                 self.selected_connection_index = 0;
                 self.last_error = Some(error.to_string());
                 self.status_message = Some("failed to load config".to_string());
@@ -878,8 +897,9 @@ impl App {
     }
 
     fn refresh_completion(&mut self, force_open: bool) {
-        let prefix = self.current_editor_prefix();
-        let items = completion::sql_completions(&prefix);
+        let before_cursor = self.editor_before_cursor();
+        let (prefix, context) = completion::completion_context(&before_cursor);
+        let items = completion::completions(&prefix, context, self.metadata.as_ref());
 
         if items.is_empty() || (!force_open && prefix.is_empty()) {
             self.close_completion();
@@ -916,24 +936,16 @@ impl App {
             self.editor.move_cursor(CursorMove::Back);
             self.editor.delete_next_char();
         }
-        self.editor.insert_str(item.insert_text);
+        self.editor.insert_str(&item.insert_text);
         self.close_completion();
     }
 
-    fn current_editor_prefix(&self) -> String {
+    fn editor_before_cursor(&self) -> String {
         let (row, col) = self.editor.cursor();
         let Some(line) = self.editor.lines().get(row) else {
             return String::new();
         };
-        let before_cursor = line.chars().take(col).collect::<String>();
-        before_cursor
-            .chars()
-            .rev()
-            .take_while(|value| value.is_ascii_alphanumeric() || *value == '_')
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect()
+        line.chars().take(col).collect::<String>()
     }
 
     fn normalize_previous_sql_keyword(&mut self) {
@@ -991,6 +1003,57 @@ impl App {
 
     pub fn command_hints(&self) -> Vec<&'static str> {
         completion::command_hints(&self.command_buffer)
+    }
+
+    fn start_metadata_load(&mut self) {
+        if self.metadata_loading {
+            return;
+        }
+        let Some(connection) = self.current_connection().cloned() else {
+            return;
+        };
+
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = db::load_metadata(&connection).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+
+        self.metadata_loading = true;
+        self.metadata_error = None;
+        self.metadata_handle = Some(MetadataHandle { receiver });
+        self.status_message = Some("loading database metadata".to_string());
+    }
+
+    fn poll_metadata(&mut self) {
+        let Some(handle) = &self.metadata_handle else {
+            return;
+        };
+
+        match handle.receiver.try_recv() {
+            Ok(Ok(metadata)) => {
+                let table_count = metadata.tables.len();
+                self.metadata = Some(metadata);
+                self.metadata_loading = false;
+                self.metadata_error = None;
+                self.metadata_handle = None;
+                self.status_message = Some(format!("metadata loaded: {table_count} tables"));
+            }
+            Ok(Err(error)) => {
+                self.metadata = None;
+                self.metadata_loading = false;
+                self.metadata_error = Some(error.clone());
+                self.metadata_handle = None;
+                self.status_message = Some(format!("metadata load failed: {error}"));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.metadata_loading = false;
+                self.metadata_error = Some("metadata worker disconnected".to_string());
+                self.metadata_handle = None;
+                self.status_message = Some("metadata worker disconnected".to_string());
+            }
+        }
     }
 }
 

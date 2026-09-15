@@ -76,6 +76,27 @@ pub struct ExecutionHandle {
     pub receiver: Receiver<ExecutionResult>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DatabaseMetadata {
+    pub tables: Vec<TableMetadata>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TableMetadata {
+    pub name: String,
+    pub columns: Vec<ColumnMetadata>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ColumnMetadata {
+    pub name: String,
+    pub data_type: String,
+}
+
+pub struct MetadataHandle {
+    pub receiver: Receiver<Result<DatabaseMetadata, String>>,
+}
+
 impl ExecutionResult {
     pub fn error(message: impl Into<String>, elapsed_ms: u128) -> Self {
         Self {

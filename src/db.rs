@@ -1,9 +1,12 @@
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use mysql::prelude::Queryable;
 use mysql::{Opts, Pool, PooledConn, Row, Value};
 
-use crate::model::{ConnectionProfile, ExecutionResult, ResultKind};
+use crate::model::{
+    ColumnMetadata, ConnectionProfile, DatabaseMetadata, ExecutionResult, ResultKind, TableMetadata,
+};
 
 const MAX_RESULT_ROWS: usize = 200;
 
@@ -14,6 +17,42 @@ pub fn execute_sql(profile: &ConnectionProfile, sql: &str) -> ExecutionResult {
         Ok(result) => result,
         Err(error) => ExecutionResult::error(error.to_string(), started_at.elapsed().as_millis()),
     }
+}
+
+pub fn load_metadata(profile: &ConnectionProfile) -> anyhow::Result<DatabaseMetadata> {
+    let url = build_mysql_url(profile);
+    let opts = Opts::from_url(&url)?;
+    let pool = Pool::new(opts)?;
+    let mut conn = pool.get_conn()?;
+
+    let table_names = conn.exec_map(
+        "select table_name from information_schema.tables where table_schema = ? and table_type = 'BASE TABLE' order by table_name",
+        (profile.database.clone(),),
+        |table_name: String| table_name,
+    )?;
+
+    let column_rows = conn.exec_map(
+        "select table_name, column_name, data_type from information_schema.columns where table_schema = ? order by table_name, ordinal_position",
+        (profile.database.clone(),),
+        |(table_name, column_name, data_type): (String, String, String)| {
+            (table_name, ColumnMetadata { name: column_name, data_type })
+        },
+    )?;
+
+    let mut columns_by_table = BTreeMap::<String, Vec<ColumnMetadata>>::new();
+    for (table_name, column) in column_rows {
+        columns_by_table.entry(table_name).or_default().push(column);
+    }
+
+    let tables = table_names
+        .into_iter()
+        .map(|name| TableMetadata {
+            columns: columns_by_table.remove(&name).unwrap_or_default(),
+            name,
+        })
+        .collect();
+
+    Ok(DatabaseMetadata { tables })
 }
 
 fn execute_sql_inner(profile: &ConnectionProfile, sql: &str) -> anyhow::Result<ExecutionResult> {
@@ -128,7 +167,7 @@ pub fn is_query_sql(sql: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::execute_sql;
+    use super::{execute_sql, load_metadata};
     use crate::model::ConnectionProfile;
 
     fn sakila_profile() -> ConnectionProfile {
@@ -155,5 +194,29 @@ mod tests {
         assert_eq!(result.columns, vec!["total"]);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0][0], "200");
+    }
+
+    #[test]
+    fn loads_sakila_metadata() {
+        let metadata = load_metadata(&sakila_profile()).expect("metadata should load");
+        let actor = metadata
+            .tables
+            .iter()
+            .find(|table| table.name == "actor")
+            .expect("actor table should exist");
+
+        assert!(actor.columns.iter().any(|column| column.name == "actor_id"));
+        assert!(
+            actor
+                .columns
+                .iter()
+                .any(|column| column.name == "first_name")
+        );
+        assert!(
+            actor
+                .columns
+                .iter()
+                .any(|column| column.name == "last_name")
+        );
     }
 }

@@ -744,7 +744,7 @@ fn render_completion(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let popup = bottom_right_rect(36, app.completion_items.len() as u16 + 2, area);
+    let popup = bottom_right_rect(54, app.completion_items.len() as u16 + 2, area);
     frame.render_widget(Clear, popup);
     let lines = app
         .completion_items
@@ -762,10 +762,15 @@ fn render_completion(frame: &mut Frame, area: Rect, app: &App) {
             };
             Line::from(vec![
                 Span::styled(if selected { ">> " } else { "   " }, style),
-                Span::styled(item.label, style),
+                Span::styled(item.label.as_str(), style),
                 Span::styled("  ", style),
                 Span::styled(
                     completion_kind_name(item.kind),
+                    Style::default().fg(DIM).bg(PANEL_BG),
+                ),
+                Span::styled("  ", Style::default().fg(DIM).bg(PANEL_BG)),
+                Span::styled(
+                    item.detail.as_deref().unwrap_or(""),
                     Style::default().fg(DIM).bg(PANEL_BG),
                 ),
             ])
@@ -881,6 +886,8 @@ fn completion_kind_name(kind: CompletionKind) -> &'static str {
     match kind {
         CompletionKind::Keyword => "keyword",
         CompletionKind::Function => "function",
+        CompletionKind::Table => "table",
+        CompletionKind::Column => "column",
     }
 }
 
