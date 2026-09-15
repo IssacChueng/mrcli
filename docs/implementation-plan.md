@@ -967,3 +967,271 @@ match self.state {
 4. UI 不直接依赖 MySQL 类型
 
 这样第二版支持 PostgreSQL 时，主要修改数据库层，不需要大改状态机和页面层。
+
+---
+
+## 18. 数据库元数据预读与补全
+
+### 18.1 目标
+
+下一阶段为 `QueryEdit` 增加基于当前连接数据库信息的补全能力：
+
+1. 预读当前数据库的表名
+2. 预读每张表的列名和字段类型
+3. 在编辑 SQL 时提示表名
+4. 在编辑 SQL 时提示列名
+5. 保留现有 SQL 关键字和函数补全
+6. 元数据加载失败时不影响 SQL 编辑和执行
+
+### 18.2 第一版支持范围
+
+建议先支持以下场景：
+
+1. `FROM` 后提示表名
+2. `JOIN` 后提示表名
+3. `SELECT`、`WHERE`、`ORDER BY` 等位置提示列名
+4. 输入 `table.` 后提示该表的列名
+5. 候选匹配不区分大小写
+6. 插入候选时保留数据库中的真实名称
+7. 候选数量限制为 12 到 20 条
+
+示例：
+
+```sql
+SELECT * FROM ac
+```
+
+提示：
+
+```text
+actor    table
+```
+
+```sql
+SELECT actor.
+```
+
+提示：
+
+```text
+actor_id    column
+first_name  column
+last_name   column
+```
+
+第一版暂不支持：
+
+1. 完整 SQL AST 解析
+2. 表别名精确解析，例如 `a.` 对应 `actor`
+3. 多 schema 补全
+4. 复杂 JOIN 上下文分析
+5. 每次输入字符都查询数据库
+
+### 18.3 MySQL 元数据查询
+
+查询表名：
+
+```sql
+select table_name
+from information_schema.tables
+where table_schema = ?
+  and table_type = 'BASE TABLE'
+order by table_name;
+```
+
+查询列信息：
+
+```sql
+select table_name, column_name, data_type
+from information_schema.columns
+where table_schema = ?
+order by table_name, ordinal_position;
+```
+
+查询参数使用当前连接配置中的数据库名称，不把数据库名直接拼入 SQL。
+
+### 18.4 数据结构
+
+建议新增以下结构：
+
+```rust
+pub struct DatabaseMetadata {
+    pub tables: Vec<TableMetadata>,
+}
+```
+
+```rust
+pub struct TableMetadata {
+    pub name: String,
+    pub columns: Vec<ColumnMetadata>,
+}
+```
+
+```rust
+pub struct ColumnMetadata {
+    pub name: String,
+    pub data_type: String,
+}
+```
+
+补全项需要从静态字符串改为运行时字符串：
+
+```rust
+pub struct CompletionItem {
+    pub label: String,
+    pub insert_text: String,
+    pub kind: CompletionKind,
+}
+```
+
+补全类型增加：
+
+1. `Keyword`
+2. `Function`
+3. `Table`
+4. `Column`
+
+### 18.5 元数据加载时机
+
+推荐在进入 `QueryList` 时后台加载当前连接的元数据：
+
+1. 用户在 `Init` 中选择连接
+2. 按 `Enter` 进入 `QueryList`
+3. 启动 metadata worker
+4. 用户进入 `QueryEdit` 时继续编辑，不阻塞界面
+5. 加载完成后补全候选自动可用
+6. 加载失败时仅更新状态栏错误信息
+
+原因：
+
+1. 避免进入编辑页时同步阻塞
+2. 用户进入编辑页前有机会完成加载
+3. 与现有 SQL 后台执行模型一致
+
+建议增加：
+
+```rust
+pub metadata: Option<DatabaseMetadata>,
+pub metadata_loading: bool,
+pub metadata_error: Option<String>,
+pub metadata_handle: Option<MetadataHandle>,
+```
+
+### 18.6 数据库模块改造
+
+在 `db.rs` 中新增：
+
+```rust
+pub fn load_metadata(
+    profile: &ConnectionProfile,
+) -> anyhow::Result<DatabaseMetadata>
+```
+
+职责：
+
+1. 建立 MySQL 连接
+2. 查询当前数据库表名
+3. 查询当前数据库列信息
+4. 组装 `DatabaseMetadata`
+5. 返回数据库无关的元数据结构
+
+元数据加载不复用 `ExecutionResult`，因为它属于编辑器辅助数据，不属于用户 SQL 执行结果。
+
+### 18.7 补全上下文
+
+建议增加：
+
+```rust
+pub enum CompletionContext {
+    Keyword,
+    Table,
+    Column,
+    TableColumn { table: String },
+    Mixed,
+}
+```
+
+初版判断规则：
+
+1. 当前 token 前一个关键词为 `FROM` 或 `JOIN`：使用 `Table`
+2. 当前 token 形如 `table.`：使用 `TableColumn`
+3. 其他位置：使用 `Mixed`
+4. 不做完整 SQL 解析
+
+### 18.8 补全模块改造
+
+建议将补全接口扩展为：
+
+```rust
+pub fn completions(
+    prefix: &str,
+    context: CompletionContext,
+    metadata: Option<&DatabaseMetadata>,
+) -> Vec<CompletionItem>
+```
+
+候选合并顺序建议：
+
+1. 当前上下文最相关的表名或列名
+2. 关键词
+3. 函数
+
+候选匹配要求：
+
+1. 大小写不敏感
+2. 前缀匹配优先
+3. 最多返回 12 到 20 条
+4. 保留数据库元数据中的原始名称
+
+### 18.9 UI 展示
+
+现有 `SQL COMPLETION` 弹窗继续复用，新增类型显示：
+
+```text
+>> actor        table
+   first_name   column
+   COUNT        function
+```
+
+如果展示字段类型，可使用：
+
+```text
+first_name     column:varchar
+actor_id       column:int
+```
+
+### 18.10 实施顺序
+
+1. 将 `CompletionItem` 的字段改为 `String`
+2. 新增 `DatabaseMetadata`、`TableMetadata`、`ColumnMetadata`
+3. 在 `db.rs` 实现 `load_metadata`
+4. 在 `App` 中增加 metadata 状态和后台任务通道
+5. 进入 `QueryList` 时启动 metadata worker
+6. 在 `on_tick` 中接收 metadata 结果
+7. 扩展补全上下文判断
+8. 合并关键字、函数、表名和列名候选
+9. 更新补全弹窗显示类型
+10. 保证原有 SQL 关键词补全和自动大写仍然有效
+
+### 18.11 验收标准
+
+使用本地 `sakila` 数据库验证：
+
+1. 进入 `QueryList` 后后台开始加载元数据
+2. 进入编辑页不会因为加载元数据卡顿
+3. 输入 `FROM ac` 能提示 `actor`
+4. 输入 `SELECT actor.` 能提示 `actor` 的字段
+5. 输入 `sel` 仍能提示 `SELECT`
+6. 元数据候选可以用 `Tab` 或 `Enter` 接受
+7. 插入表名和列名时使用数据库真实名称
+8. 元数据加载失败时仍可手动输入和执行 SQL
+9. 关键词自动大写功能不受影响
+
+### 18.12 风险与约束
+
+1. 元数据加载必须放到后台线程，不能阻塞主循环
+2. 表和字段数量很大时必须限制候选数量
+3. 候选匹配大小写不敏感，但插入内容不能统一转大写
+4. 不要在每次按键时访问数据库
+5. 当前阶段只实现 MySQL 元数据查询
+6. 后续支持 PostgreSQL 时，在数据库层补充对应查询即可
